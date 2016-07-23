@@ -1,0 +1,642 @@
+= CameraServer Library
+:toc: macro
+:sectanchors:
+:source-highlighter: pygments
+:pygments-style: colorful
+
+toc::[]
+
+== Summary
+
+The purpose of the camera server library is to provide a standardized,
+high performance, robust, and reliable method for robot code to access
+multiple cameras (either USB or IP), configure the camera settings,
+provide images to robot code, and stream either raw camera images or
+robot code processed images as M-JPEG over HTTP stream(s) to dashboard
+applications.
+
+== Motivation
+
+The current approach used for connecting to USB or Ethernet cameras
+and processing and/or forwarding camera feeds to the driver station is
+high overhead, limited to a single camera, and uses the IMAQ library
+(which is non-portable and requires expensive translation to work with
+OpenCV).
+
+The current dashboard camera streams use a custom protocol for setting
+resolution and frame rate and are not compatible with standard tools.
+There is no support for setting other camera settings such as
+brightness through the current protocol or easily making these
+settings persistent.
+
+== References
+
+[[rfc2435,RFC2435]]
+* RFC 2435, RTP Payload Format for JPEG-compressed Video,
+https://tools.ietf.org/html/rfc2435
+
+[[rfc3550,RFC3550]]
+* RFC 3550, RTP: A Transport Protocol for Real-Time Applications,
+https://tools.ietf.org/html/rfc3550
+
+[[rfc2326,RFC2326]]
+* RFC 2326, Real Time Streaming Protocol (RTSP),
+https://tools.ietf.org/html/rfc2326
+
+[[MJPEG-HTTP]]
+* M-JPEG over HTTP, http://en.wikipedia.org/wiki/Motion_JPEG
+
+== Architecture
+
+The basic architecture of the CameraServer library is similar to that
+of MJPGStreamer, with functionality split between sources and sinks.
+There can be multiple sources and multiple sinks created and operating
+simultaneously.
+
+* Sources obtain individual frames (such as provided by a USB camera)
+and fire an event when a new frame is available.  If no sinks are
+listening to a particular source, the library may pause or disconnect
+from a source to save processor and I/O resources.  The library
+autonomously handles camera disconnects/reconnects by simply pausing
+and resuming firing of events (e.g. a disconnect results in no new
+frames, not an error).
+
+* Sinks listen to a particular source's event, grab the latest
+image, and forward it to its destination in the appropriate format.
+Similarly to sources, if a particular sink is inactive (e.g. no client
+is connected to a configured M-JPEG over HTTP server), the library
+may disable parts of its processing to save processor resources.
+
+* In addition, user code (such as that used in a FRC robot program)
+can act as either a source (providing processed frames as if it were a
+camera) or as a sink (receiving a frame for processing).
+
+The library distinguishes "frames" from "images" as some types of
+cameras (such as depth cameras or binocular vision cameras) can
+provide multiple images per frame (the library refers to these as
+numbered "channels").  Standard (non-user) sinks such as HTTP streams
+are only capable of handling single images, so it's necessary to
+configure a sink to select which channel of the frame should be used
+by the sink.
+
+The library is designed to run as separate threads within the user
+process.  This is primarily done for efficiency reasons in the case of
+user image processing, but also ensures a clean, consistent runtime
+environment each time the user program is run.
+
+== NetworkTables Interface
+
+Camera settings are communicated via NetworkTables.
+
+== Implementation
+
+For performance reasons, the library is implemented in {cpp} and
+provides both a C and {cpp} API.  A Java API is provided via JNI.
+Similar to NTcore, this library will be put into a separate
+repository but referenced by WPILibC and WPILibJ.
+
+=== Dependencies
+
+* OpenCV
+* WPILib Utility Library (TBR: or NTcore)
+
+=== Portability
+
+While the primary target platform is Linux (both embedded and
+desktop), the library also provides Windows support to enable use
+cases such as off-robot simulation or image processing testing.
+
+[[class-api]]
+== Class-Based API (for {cpp} and Java)
+
+There are two classes: `CameraSource` and `CameraSink`.  Instances of
+these classes are created using static factory functions to ensure
+automatic lifetime management (the constructors for these classes are
+private).
+
+=== CameraSource
+
+==== CSource.createUSBCamera
+
+[source,cpp]
+static std::shared_ptr<CameraSource> CameraSource::CreateUSBCamera(int dev);
+static std::shared_ptr<CameraSource> CameraSource::CreateUSBCamera(const char* path);
+
+[source,java]
+static CameraSource createUSBCamera(int dev);
+static CameraSource createUSBCamera(string path);
+
+Connects to a USB camera based on device number (e.g. on Linux, the
+`N` in `/dev/videoN`) or device path (e.g. `/dev/videoN` or
+`/dev/v4l/by-path/pci-...`).
+
+==== CSource.createHTTPCamera
+
+[source,cpp]
+static std::shared_ptr<CameraSource> CameraSource::CreateHTTPCamera(const char* url);
+
+[source,java]
+static CameraSource createHTTPCamera(string url);
+
+Connects to a M-JPEG over HTTP server (as commonly provided by IP
+cameras).  URL should be of the form
+`"http://user:pass@server:port/path/to/stream"`.
+
+==== CSource.createUserSource
+
+[source,cpp]
+static std::shared_ptr<CameraSource> CameraSource::CreateUserSource(int nChannels);
+
+[source,java]
+static CameraSource createUserSource(int nChannels);
+
+Creates a user (image) source with the specified number of channels.
+
+==== CSource.putImage
+
+[source,cpp]
+void CameraSource::PutImage(int channel, cv::Mat* image);
+
+[source,java]
+void putImage(int channel, CvMat image);
+
+Puts an OpenCV image as the latest image for an user source and
+channel.  This does *not* notify sinks that a new image is available;
+notifyFrame() must be called to do that.
+
+This function is only valid for use with sources created with
+CameraSource.createUserSource().
+
+==== CSource.notifyFrame
+
+[source,cpp]
+void CameraSource::NotifyFrame();
+
+[source,java]
+void notifyFrame();
+
+Notifies sinks that a user source has a new frame available.
+
+This function is only valid for use with sources created with
+CameraSource.createUserSource().
+
+==== CSource.waitForFrame
+
+[source,cpp]
+long CameraSource::WaitForFrame();  // returns frame timestamp
+
+[source,c]
+long waitForFrame();  // returns frame timestamp
+
+Polled interface to wait for a new frame from an source (usually a
+camera, but can be a user source).
+
+This function is blocking and does not return until a new frame has
+been received or the source has been destroyed by another thread or
+due to program shutdown (in which case 0 is returned).  In particular,
+this function does *not* return simply due to a camera disconnect (as
+this may be a temporary condition).
+
+==== CSource.getImage
+
+[source,cpp]
+long CameraSource::GetImage(int channel, cv::Mat* image);  // returns frame timestamp
+
+[source,c]
+long getImage(int channel, CvMat image);  // returns frame timestamp
+
+Gets the latest image from an source (usually a camera).  The image is
+provided as a OpenCV image in whatever raster format is provided by
+the camera.
+
+The frame timstamp is also provided to detect if a new frame has been
+received.  In general, code should call `WaitForFrame()` before using
+this function, as this function is expensive to execute.
+
+==== GetSourceInfo
+
+[source,c]
+CS_SourceInfo* CS_GetSourceInfo(CS_Source source);
+
+Gets information about the source (see <<sourceinfo>>).
+
+=== CameraSink
+
+==== CSink.createHTTPSink
+
+[source,cpp]
+static std::shared_ptr<CameraSink> CameraSink::CreateHTTPSink(const char* listenAddress, int port);
+
+[source,java]
+static CameraSink createHTTPSink(string listenAddress, int port);
+
+Creates a M-JPEG over HTTP server at the specified port.  The server
+allows multiple clients to connect to the port (this will effectively
+act as multiple virtual sinks listening to the same source that is
+configured for this sink).
+
+==== CSink.createRTSPSink
+
+[source,cpp]
+static std::shared_ptr<CameraSink> CameraSink::CreateRTSPSink(const char* listenAddress, int port);
+
+[source,java]
+static CameraSink createRTSPSink(string listenAddress, int port);
+
+Creates a M-JPEG over RTP server at the specified port.  The RTSP
+server will be at the specified port, but data will be sent via M-JPEG
+over UDP in accordance with <<rfc2435>>.
+
+
+
+[[c-api]]
+== C API
+
+The C API is the implementation-level API used to implement both the
+{cpp} and Java class-based API.
+
+The C API prefixes all names with `CS_`.
+
+The C API uses an opaque handle based approach.  While handles do not
+have unique types (all handles are `typedef int` in the API), they are
+globally unique in the library, and the library can detect bugs such
+as interchanging of a source and a sink handle.
+
+Handle types:
+
+* CS_Source
+
+* CS_Sink
+
+* CS_SourceListener
+
+* CS_SinkListener
+
+The API for cameras is based on that provided by OpenCV.  This is
+intentional, as on Linux systems the functions will largely be
+passthrough (at least for USB cameras).
+
+=== Source Management
+
+==== CreateUSBCameraDev
+
+[source,c]
+CS_Source CS_CreateUSBCameraDev(int dev);
+
+Connects to a USB camera based on device number (e.g. on Linux,
+`/dev/videoN`).
+
+==== CreateUSBCameraPath
+
+[source,c]
+CS_Source CS_CreateUSBCameraPath(const char* path);
+
+Connects to a USB camera at the specified path.  Using this can
+resolve ambiguity when using multiple USB cameras.
+
+On Linux, this can either be `/dev/videoN` (note: this does not solve
+the ambiguity problem) or something that symlinks to it such as
+`/dev/v4l/by-path/pci-...`.
+
+TBD: How to do something similar on Windows.
+
+==== CreateHTTPCamera
+
+[source,c]
+CS_Source CS_CreateHTTPCamera(const char* url);
+
+Connects to a M-JPEG over HTTP server (as commonly provided by IP
+cameras).  URL should be of the form
+`"http://user:pass@server:port/path/to/stream"`.
+
+==== CreateUserSource
+
+[source,c]
+CS_Source CS_CreateUserSource(int nChannels);
+
+==== DestroySource
+
+[source,c]
+void CS_DestroySource(CS_Source source);
+
+==== EnumerateSources
+
+==== EnumerateUSBCameras
+
+[[usbcamerainfo]]
+===== USBCameraInfo
+
+[cols="1,3"]
+|===
+|Field Name |Field Type
+
+|Index
+|Integer, Device Number (as taken by CreateUSBCameraDev)
+
+|Path
+|String, Device Number (as taken by CreateUSBCameraPath)
+
+|Name
+|String, short description of camera (not guaranteed to be unique)
+
+|# Channels
+|Number of channels the source provides
+|===
+
+==== AddSourceListener
+
+[source,c]
+CS_SourceListener CS_AddSourceListener(void (*callback) (CS_Source source, const CS_SourceInfo* info, int event), int eventMask);
+
+Notifies a callback function when a source is created, destroyed, or
+changes state.  The eventMask is a bitmask which specifies what events
+should cause a callback to occur.
+
+[cols="1,3"]
+|===
+|Event |Description
+
+|Create
+|New source created
+
+|Destroy
+|Source destroyed
+
+|Connected
+|Source connected (e.g. camera successfully connected)
+
+|Disconnected
+|Source disconnected (lost IP connection, USB camera disconnected)
+|===
+
+
+==== RemoveSourceListener
+
+[source,c]
+void CS_RemoveSourceListener(CS_SourceListener listener);
+
+=== Sink Management
+
+==== CreateHTTPSink
+
+[source,c]
+CS_Sink CS_CreateHTTPSink(const char* listenAddress, int port);
+
+Creates a M-JPEG over HTTP server at the specified port.  The server
+allows multiple clients to connect to the port (this will effectively
+act as multiple virtual sinks listening to the same source that is
+configured for this sink).
+
+==== CreateRTSPSink
+
+[source,c]
+CS_Sink CS_CreateRTSPSink(const char* listenAddress, int port);
+
+Creates a M-JPEG over RTP server at the specified port.  The RTSP
+server will be at the specified port, but data will be sent via M-JPEG
+over UDP in accordance with <<rfc2435>>.
+
+==== DestroySink
+
+[source,c]
+void CS_DestroySink(CS_Sink sink);
+
+==== EnumerateSinks
+
+==== AddSinkListener
+
+==== RemoveSinkListener
+
+=== User Source Functions
+
+These functions are only valid for use with sources created with
+CreateUserSource().
+
+==== PutImage
+
+[source,c]
+void CS_PutImage(CS_Source source, int channel, CvMat* image);
+
+Puts an OpenCV image as the latest image for an user source and
+channel.  This does *not* notify sinks that a new image is available;
+NotifyFrame() must be called to do that.
+
+==== NotifyFrame
+
+[source,c]
+void CS_NotifyFrame(CS_Source source);
+
+Notifies sinks that a user source has a new frame available.
+
+=== Source Functions
+
+==== WaitForFrame
+
+[source,c]
+long CS_WaitForFrame(CS_Source source);  // returns frame timestamp
+
+Polled interface to wait for a new frame from an source (usually a
+camera).
+
+This function is blocking and does not return until a new frame has
+been received or the source has been destroyed by another thread or
+due to program shutdown (in which case 0 is returned).  In particular,
+this function does *not* return simply due to a camera disconnect (as
+this may be a temporary condition).
+
+==== GetImage
+
+[source,c]
+CS_ErrorCode CS_GetImage(CS_Source source, int channel, CvMat* image, long* timestamp);
+
+Gets the latest image from an source (usually a camera).  The image is
+provided as a OpenCV image in whatever raster format is provided by
+the camera.
+
+The frame timstamp is also provided to detect if a new frame has been
+received.  In general, code should call `WaitForFrame()` before using
+this function, as this function is expensive to execute.
+
+==== GetSourceInfo
+
+[source,c]
+CS_SourceInfo* CS_GetSourceInfo(CS_Source source);
+
+Gets information about the source (see <<sourceinfo>>).
+
+[[sourceinfo]]
+===== SourceInfo
+
+[cols="1,3"]
+|===
+|Field Name |Field Type
+
+|Id
+|Integer, Source Id (as returned by CreateX)
+
+|Description
+|String, short description of source (type-dependent)
+
+|Connected
+|Boolean, whether the source is currently connected to the device.  Always
+true for UserSource sources.
+
+|Last Frame Time
+|Timestamp of last frame generated by this source.  If no sinks are
+connected, may not be updated.
+
+|# Channels
+|Number of channels the source provides
+|===
+
+==== GetCameraParameters
+
+==== SetCameraParameters
+
+=== Sink Functions
+
+==== SetSinkSource
+
+[source,c]
+CS_ErrorCode CS_SetSinkSource(CS_Sink sink, CS_Source source, int channel);
+
+Configures the sink to get images from the specified source and
+channel.
+
+==== GetSinkInfo
+
+=== C API Examples
+
+==== Stream a single USB camera as a HTTP M-JPEG stream
+
+This simple example provides a M-JPEG stream for a single USB camera
+on port 5800.  The streaming server will run in the background until
+the program terminates.  This example can be simply extended for
+multiple USB cameras (just copy and paste with different device
+numbers and port numbers).
+
+[source,c]
+----
+CS_Source cameraSource = CS_CreateUSBCameraDev(0);
+CS_Sink httpSink = CS_CreateHTTPSink("", 5800);
+CS_SetSinkSource(httpSink, cameraSource, 0);
+----
+
+=== {cpp} API Examples
+
+==== Process USB camera images and stream both unprocessed and processed M-JPEG
+
+The below example code provides the raw USB camera stream on port
+5800, but also processes the image and provides the processed image on
+port 5801.
+
+[source,cpp]
+----
+// In separate thread (due to blocking call to WaitForFrame)
+
+// Create sources
+auto cameraSource = CameraSource::CreateUSBCameraDev(0);
+auto processedSource = CameraSource::CreateUserSource(1);
+
+// Create sinks and connect them to desired sources
+auto unprocessedSink = CameraSink::CreateHTTPSink("", 5800);
+auto processedSink = CameraSink::CreateHTTPSink("", 5801);
+unprocessedSink->SetSource(cameraSource, 0);
+processedSink->SetSource(processedSource, 0);
+
+for (;;) {
+  // Wait for a new frame from the camera
+  long ts = cameraSource->WaitForFrame();
+  if (ts == 0) break;  // program ending...
+
+  // Get OpenCV image from camera
+  cv::Mat image;
+  long ts2;
+  CS_ErrorCode err = cameraSource->GetImage(0, &image, &ts2);
+  if (err != CS_OK) continue;
+
+  // ... process image using OpenCV ...
+
+  // Provide processed image
+  processedSource->PutImage(0, image);
+  processedSource->NotifyFrame();
+}
+----
+
+==== Process binocular camera images
+
+[source,cpp]
+----
+// In separate thread (due to blocking call to WaitForFrame)
+
+auto cameraSource = CameraSource::CreateUSBCameraDev(0);
+
+for (;;) {
+  // Wait for a new frame from the camera
+  long ts = cameraSource->WaitForFrame();
+  if (ts == 0) break;  // program ending...
+
+  // Get OpenCV images from camera
+  cv::Mat image0;
+  long ts0;
+  CS_ErrorCode err = cameraSource->GetImage(0, &image, &ts0);
+  if (err != CS_OK) continue;
+
+  cv::Mat image1;
+  long ts1;
+  CS_ErrorCode err = cameraSource->GetImage(1, &image, &ts1);
+  if (err != CS_OK) continue;
+
+  if (ts != ts0 || ts != ts1) {
+    // Received split image (processor too slow?)
+    continue;
+  }
+
+  // ... process images using OpenCV ...
+}
+----
+
+== Drawbacks
+
+* As a separate {cpp} library, it will be difficult for teams to
+modify the behavior of the library.  Cross-platform builds of the
+library will be required to support off-robot Java use (e.g. for
+simulation).
+
+* Tight integration with OpenCV increases difficulty of using NIVision
+image processing functions if those are preferred by a team.
+
+== Alternatives
+
+* Update existing CameraServer {cpp} and Java classes.
+
+* Use unmodified MJPGStreamer.  While this approach was used by a
+number of teams in the 2016 season, there are several major downsides
+to this approach.  All settings are configured with a text file, only
+2 cameras are supported, and there is no provision for on-robot
+image processing or providing processed images to the dashboard.
+
+* Use customized MJPGStreamer.  While this could solve several of the
+issues with an unmodified MJPGStreamer, such as use of NetworkTables
+instead of a configuration text file for camera settings, as a
+separate process it still has increased complexity and performance
+impacts for on-robot image processing, and also makes the execution
+environment less consistent (as a robot reboot has different effects
+than a code reboot).
+
+== Unresolved Questions
+
+* What's the cleanest interface for user sources?  Return just a
+`CameraSource` as done here, or provide some kind of interface base
+class with callbacks?  Lifetime management might be difficult with the
+latter.
+
+* Supporting things like Kinect will add major dependencies (like
+OpenNI).  Plugins seem like the right way to handle this but that also
+adds significant complexity.
+
+* Error reporting/handling?
+
+* Should exposing things like camera settings to NetworkTables be done
+here or at the next higher level of libraries?
+
